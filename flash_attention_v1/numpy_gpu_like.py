@@ -1,4 +1,8 @@
 import numpy as np
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from common.reference import naive_attention, check_accuracy, print_comparison
 
 def mat_mul_scaled(A, B, C, b, m, n, k):
     """
@@ -332,21 +336,6 @@ def flash_attention_tiled(Q, K, V, O, L, d, Bq=8, Bk=8):
                 O[q_start + i, j] = O_tile[i, j]
 
 
-# Optional: naive reference implementation to compare
-def naive_attention(Q, K, V):
-    """
-    Naive attention: softmax(Q K^T / sqrt(d)) V
-    Q, K, V: [L, d]
-    Returns: [L, d]
-    """
-    L, d = Q.shape
-    scale = 1.0 / np.sqrt(d)
-    scores = (Q @ K.T) * scale           # [L, L]
-    probs = np.exp(scores - scores.max(axis=1, keepdims=True))
-    probs = probs / probs.sum(axis=1, keepdims=True)
-    return probs @ V                     # [L, d]
-
-
 if __name__ == "__main__":
     L = 2048
     d = 32
@@ -360,25 +349,7 @@ if __name__ == "__main__":
 
     # Allocate output buffer outside (like GPU kernel)
     flash_attention_tiled(Q, K, V, O_tiled, L, d, Bq=8, Bk=8)
-    
-    O_naive = naive_attention(Q, K, V)
+    O_reference = naive_attention(Q, K, V)
 
-    print("O_tiled shape:", O_tiled.shape)
-    print("First 3 rows (tiled):")
-    print(O_tiled[:3, :5])
-
-    print("\nFirst 3 rows (naive):")
-    print(O_naive[:3, :5])
-
-    # Check closeness
-    diff = np.abs(O_tiled - O_naive).max()
-    print("\nMax absolute difference:", diff)
-    
-    # Relative difference (max can be misleading for near-zero values)
-    rel_diff = (np.abs(O_tiled - O_naive) / (np.abs(O_naive) + 1e-8)).max()
-    print("Max relative difference:", rel_diff)
-    
-    # Mean relative error (excluding very small values)
-    mask = np.abs(O_naive) > 1e-3
-    mean_rel_err = (np.abs(O_tiled[mask] - O_naive[mask]) / np.abs(O_naive[mask])).mean()
-    print("Mean relative error (|naive| > 1e-3):", mean_rel_err)
+    print_comparison(O_tiled, O_reference)
+    check_accuracy(O_tiled, O_reference)
