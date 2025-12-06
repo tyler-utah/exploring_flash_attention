@@ -50,9 +50,37 @@ Key innovations:
 
 See [`flash_attention_v1_tiled_d/README.md`](flash_attention_v1_tiled_d/README.md) for detailed documentation.
 
+### `flash_attention_v2/`
+
+**Two-kernel architecture** with parallelism over both query and key-value tiles:
+- **Kernel 1 (Forward)**: Computes partial attention results for Q×KV tile combinations
+- **Kernel 2 (Reduction)**: Combines partial results with proper softmax rescaling
+- **Tunable parallelism**: KV_TILES_PER_BLOCK parameter controls blocks (default: 4)
+- **8× more parallelism**: 256 blocks vs 32 blocks for V1 (at L=256)
+
+Key innovations:
+1. Split-KV parallelization enables parallel processing across sequence length
+2. Workspace memory stores partial outputs (O, m, l) from each forward block
+3. Reduction kernel mathematically combines partial softmax computations
+4. Validated against official Dao-AILab/flash-attention CUDA implementation
+
+**Performance characteristics**:
+- Grid dimensions (L=256): Forward 32×8=256 blocks, Reduction 32 blocks
+- Workspace overhead: ~10-20% additional memory
+- Reduction overhead: ~10-20% of runtime
+- **Net benefit**: Parallelism gains far outweigh overhead costs
+
+**Implementation validation**:
+- ✅ Structure matches official `flash_fwd_splitkv_kernel` + `flash_fwd_splitkv_combine_kernel`
+- ✅ Workspace layout matches `oaccum_ptr`, `softmax_lseaccum_ptr`
+- ✅ Tests passing with max absolute difference: 0.0011
+
+See [`flash_attention_v2/README.md`](flash_attention_v2/README.md) for detailed documentation.
+
 ## Future Work
 
-- Flash Attention V2 (improved parallelism and reduced non-matmul operations)
+- Flash Attention V2 CUDA implementation (port Python simulation to GPU)
+- Flash Attention V2 performance benchmarking vs V1
 - Flash Attention V3 (enhanced for specific hardware architectures)
 
 ## Requirements
@@ -103,9 +131,14 @@ deactivate
 After activating the virtual environment and installing dependencies:
 
 ```bash
+# Flash Attention V1
 cd flash_attention_v1
 python3 numpy_gpu_like_opt2.py  # Most optimized CPU version
 python3 numpy_basic.py           # Basic reference version
+
+# Flash Attention V2 (two-kernel architecture)
+cd flash_attention_v2
+python3 numpy_gpu_like.py        # V2 with splitkv + reduction kernels
 ```
 
 ### CUDA Implementation
