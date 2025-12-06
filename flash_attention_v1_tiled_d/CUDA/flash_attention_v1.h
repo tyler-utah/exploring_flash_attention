@@ -8,23 +8,23 @@
 
 // Configuration constants
 #ifndef BQ
-#define BQ 8           // Query tile size
+#define BQ 16          // Query tile size (larger for better compute efficiency)
 #endif
 
 #ifndef BK
-#define BK 8           // Key/Value tile size
+#define BK 16          // Key/Value tile size (matches BQ, enables Tensor Cores if used)
 #endif
 
 #ifndef D_TILE_QK
-#define D_TILE_QK 16   // Head dimension tile size for Q@K^T
+#define D_TILE_QK 32   // Head dimension tile size for Q@K^T (larger reduces d-loop iterations)
 #endif
 
 #ifndef D_TILE_V
-#define D_TILE_V 16    // Head dimension tile size for S@V
+#define D_TILE_V 32    // Head dimension tile size for S@V (matches D_TILE_QK for consistency)
 #endif
 
 #ifndef THREADS_PER_BLOCK
-#define THREADS_PER_BLOCK 64  // Number of threads per block
+#define THREADS_PER_BLOCK 256  // Number of threads per block (good parallelism, low register pressure)
 #endif
 
 #ifndef D
@@ -51,43 +51,23 @@ __device__ __host__ inline int idx2d(int i, int j, int cols) {
     return i * cols + j;
 }
 
-// Scaled matrix multiplication with transpose, tiled along d dimension
-// Computes: C = A @ B^T * scale
-// A: [m, k], B: [n, k], C: [m, n]
-// Tiles the inner dimension k into chunks of d_tile
-__device__ void mat_mul_scaled_d_tiled(
-    const DATA_TYPE* A, const DATA_TYPE* B, DATA_TYPE* C,
-    float scale, int m, int n, int k, int d_tile
+// Compute partial Q@K^T for one d-tile chunk
+// Q_chunk: [bq, d_tile_qk], K_chunk: [bk, d_tile_qk]
+// Accumulates into S: [bq, bk]
+__device__ void mat_mul_chunk_accumulate(
+    const DATA_TYPE* Q_chunk, const DATA_TYPE* K_chunk, DATA_TYPE* S,
+    int bq, int bk, int d_tile_size
 ) {
-    // Initialize output (all threads participate)
-    for (int idx = threadIdx.x; idx < m * n; idx += blockDim.x) {
-        C[idx] = FLOAT_TO_DATA(0.0f);
-    }
-    __syncthreads();
-    
-    // Tile over k dimension
-    for (int k_start = 0; k_start < k; k_start += d_tile) {
-        int k_end = min(k_start + d_tile, k);
-        int k_sub = k_end - k_start;
+    for (int idx = threadIdx.x; idx < bq * bk; idx += blockDim.x) {
+        int i = idx / bk;
+        int j = idx % bk;
         
-        // Each thread computes partial dot products
-        for (int idx = threadIdx.x; idx < m * n; idx += blockDim.x) {
-            int i = idx / n;
-            int j = idx % n;
-            
-            float sum = 0.0f;
-            for (int kk = 0; kk < k_sub; kk++) {
-                sum += DATA_TO_FLOAT(A[idx2d(i, k_start + kk, k)]) *
-                       DATA_TO_FLOAT(B[idx2d(j, k_start + kk, k)]);
-            }
-            C[idx] = FLOAT_TO_DATA(DATA_TO_FLOAT(C[idx]) + sum);
+        float sum = 0.0f;
+        for (int kk = 0; kk < d_tile_size; kk++) {
+            sum += DATA_TO_FLOAT(Q_chunk[idx2d(i, kk, d_tile_size)]) *
+                   DATA_TO_FLOAT(K_chunk[idx2d(j, kk, d_tile_size)]);
         }
-        __syncthreads();
-    }
-    
-    // Apply scaling
-    for (int idx = threadIdx.x; idx < m * n; idx += blockDim.x) {
-        C[idx] = FLOAT_TO_DATA(DATA_TO_FLOAT(C[idx]) * scale);
+        S[idx] = FLOAT_TO_DATA(DATA_TO_FLOAT(S[idx]) + sum);
     }
     __syncthreads();
 }
@@ -119,58 +99,91 @@ __device__ void row_sum_mul_add_inplace(
     }
 }
 
-// Fused scale rows and matrix multiply-add with d-tiling for V
-// A = A * v[i] + B @ C
-// Tiles C (V matrix) along n dimension using d_tile_v
-__device__ void mat_scale_rows_mul_add_d_tiled(
-    DATA_TYPE* A, const float* v, const DATA_TYPE* B, const DATA_TYPE* C,
-    int m, int n, int k, int d_tile_v
+// Compute S@V for one d-tile chunk and accumulate into register-based output
+// Each thread updates its owned output elements
+// S: [bq, bk], V_chunk: [bk, d_tile_v]
+__device__ void accumulate_output_chunk(
+    float* O_reg, const DATA_TYPE* S, const DATA_TYPE* V_chunk,
+    const float* alpha, int bq, int bk, int d_tile_size, int d_offset,
+    int elems_per_thread, int thread_start_elem
 ) {
-    // First scale A by v
-    for (int idx = threadIdx.x; idx < m * n; idx += blockDim.x) {
-        int i = idx / n;
-        A[idx] = FLOAT_TO_DATA(DATA_TO_FLOAT(A[idx]) * v[i]);
-    }
-    __syncthreads();
-    
-    // Then compute matmul in tiles along n dimension
-    for (int d_v_start = 0; d_v_start < n; d_v_start += d_tile_v) {
-        int d_v_end = min(d_v_start + d_tile_v, n);
-        int d_v_sub = d_v_end - d_v_start;
+    // Each thread processes its assigned output elements
+    for (int t = 0; t < elems_per_thread; t++) {
+        int linear_idx = thread_start_elem + t;
+        if (linear_idx >= bq * D) break;
         
-        // Each thread computes its assigned elements for this d-tile
-        for (int idx = threadIdx.x; idx < m * d_v_sub; idx += blockDim.x) {
-            int i = idx / d_v_sub;
-            int j_local = idx % d_v_sub;
-            int j_global = d_v_start + j_local;
+        int row = linear_idx / D;
+        int col = linear_idx % D;
+        
+        // Only process if this column is in the current d-tile
+        if (col >= d_offset && col < d_offset + d_tile_size) {
+            int col_local = col - d_offset;
             
+            // Scale by alpha
+            O_reg[t] *= alpha[row];
+            
+            // Accumulate S @ V_chunk contribution
             float sum = 0.0f;
-            for (int kk = 0; kk < k; kk++) {
-                sum += DATA_TO_FLOAT(B[idx2d(i, kk, k)]) * 
-                       DATA_TO_FLOAT(C[idx2d(kk, j_global, n)]);
+            for (int k = 0; k < bk; k++) {
+                sum += DATA_TO_FLOAT(S[idx2d(row, k, bk)]) * 
+                       DATA_TO_FLOAT(V_chunk[idx2d(k, col_local, d_tile_size)]);
             }
-            A[idx2d(i, j_global, n)] = 
-                FLOAT_TO_DATA(DATA_TO_FLOAT(A[idx2d(i, j_global, n)]) + sum);
+            O_reg[t] += sum;
         }
-        __syncthreads();
     }
 }
 
-// Core tile processing function
+// Core tile processing with TRUE d-tiling (loads chunks from global memory)
 __device__ void process_kv_tile(
-    const DATA_TYPE* Q_tile, const DATA_TYPE* K_tile, const DATA_TYPE* V_tile,
-    float* m, float* l, DATA_TYPE* O_acc,
-    int bq, int bk, int d, int d_tile_qk, int d_tile_v,
-    DATA_TYPE* S, float* alpha
+    const DATA_TYPE* Q_global, const DATA_TYPE* K_global, const DATA_TYPE* V_global,
+    int q_start, int k_start, int bq, int bk, int d,
+    float* m, float* l, float* O_reg,
+    DATA_TYPE* QK_chunk, DATA_TYPE* V_chunk, DATA_TYPE* S, float* alpha,
+    int d_tile_qk, int d_tile_v, int base_offset,
+    int elems_per_thread, int thread_start_elem
 ) {
     float inv_sqrt_d = 1.0f / sqrtf((float)d);
     
-    // 1) Compute scores: S = Q_tile @ K_tile^T / sqrt(d)
-    //    WITH D-TILING along the d dimension (using d_tile_qk)
-    mat_mul_scaled_d_tiled(Q_tile, K_tile, S, inv_sqrt_d, bq, bk, d, d_tile_qk);
+    // Initialize S to zero
+    for (int idx = threadIdx.x; idx < bq * bk; idx += blockDim.x) {
+        S[idx] = FLOAT_TO_DATA(0.0f);
+    }
     __syncthreads();
     
-    // 2) Compute rescale factor and update m in place
+    // 1) Compute S = Q @ K^T with d-tiling (load chunks from global memory)
+    for (int d_start = 0; d_start < d; d_start += d_tile_qk) {
+        int d_end = min(d_start + d_tile_qk, d);
+        int d_size = d_end - d_start;
+        
+        // Load Q chunk [bq, d_tile_qk]
+        for (int idx = threadIdx.x; idx < bq * d_size; idx += blockDim.x) {
+            int i = idx / d_size;
+            int j = idx % d_size;
+            QK_chunk[idx2d(i, j, d_tile_qk)] = 
+                Q_global[base_offset + idx2d(q_start + i, d_start + j, d)];
+        }
+        
+        // Load K chunk [bk, d_tile_qk] - reuse space after Q
+        DATA_TYPE* K_chunk = QK_chunk + BQ * D_TILE_QK;
+        for (int idx = threadIdx.x; idx < bk * d_size; idx += blockDim.x) {
+            int i = idx / d_size;
+            int j = idx % d_size;
+            K_chunk[idx2d(i, j, d_tile_qk)] = 
+                K_global[base_offset + idx2d(k_start + i, d_start + j, d)];
+        }
+        __syncthreads();
+        
+        // Accumulate partial Q@K^T
+        mat_mul_chunk_accumulate(QK_chunk, K_chunk, S, bq, bk, d_size);
+    }
+    
+    // Apply scaling to S
+    for (int idx = threadIdx.x; idx < bq * bk; idx += blockDim.x) {
+        S[idx] = FLOAT_TO_DATA(DATA_TO_FLOAT(S[idx]) * inv_sqrt_d);
+    }
+    __syncthreads();
+    
+    // 2) Compute rescale factor and update m
     for (int i = threadIdx.x; i < bq; i += blockDim.x) {
         float new_max = m[i];
         for (int j = 0; j < bk; j++) {
@@ -184,18 +197,33 @@ __device__ void process_kv_tile(
     }
     __syncthreads();
     
-    // 3) Fused: Shift scores and exponentiate in place
+    // 3) Shift scores and exponentiate
     mat_sub_vec_exp(S, m, S, bq, bk);
     __syncthreads();
     
-    // 4) Fused: Row sum and update running denom in place
+    // 4) Update running denominator
     row_sum_mul_add_inplace(S, l, alpha, bq, bk);
     __syncthreads();
     
-    // 5) Fused: Rescale old numerator and accumulate contribution
-    //    WITH D-TILING: V is tiled along d dimension (using d_tile_v)
-    mat_scale_rows_mul_add_d_tiled(O_acc, alpha, S, V_tile, bq, d, bk, d_tile_v);
-    __syncthreads();
+    // 5) Compute O += S @ V with d-tiling on V (accumulate into registers)
+    for (int d_start = 0; d_start < d; d_start += d_tile_v) {
+        int d_end = min(d_start + d_tile_v, d);
+        int d_size = d_end - d_start;
+        
+        // Load V chunk [bk, d_tile_v]
+        for (int idx = threadIdx.x; idx < bk * d_size; idx += blockDim.x) {
+            int i = idx / d_size;
+            int j = idx % d_size;
+            V_chunk[idx2d(i, j, d_tile_v)] = 
+                V_global[base_offset + idx2d(k_start + i, d_start + j, d)];
+        }
+        __syncthreads();
+        
+        // Accumulate into register-based output
+        accumulate_output_chunk(O_reg, S, V_chunk, alpha, bq, bk, d_size, d_start,
+                               elems_per_thread, thread_start_elem);
+        __syncthreads();
+    }
 }
 
 // Main flash attention kernel
@@ -222,35 +250,37 @@ __global__ void flash_attention_kernel(
     // Compute base offset for this (batch, head) pair: [B, H, L, d]
     const int base_offset = (batch_idx * H * L * d_runtime) + (head_idx * L * d_runtime);
     
-    // Shared memory allocation
+    // Shared memory allocation - TRUE d-tiling (only tile-sized chunks)
     extern __shared__ char shared_mem_raw[];
     DATA_TYPE* shared_mem_data = reinterpret_cast<DATA_TYPE*>(shared_mem_raw);
     
-    DATA_TYPE* Q_tile = shared_mem_data;                          // [BQ * D]
-    DATA_TYPE* K_tile = Q_tile + BQ * D;                          // [BK * D]
-    DATA_TYPE* V_tile = K_tile + BK * D;                          // [BK * D]
-    DATA_TYPE* O_acc = V_tile + BK * D;                           // [BQ * D]
-    DATA_TYPE* S = O_acc + BQ * D;                                // [BQ * BK]
+    // QK chunks: space for Q and K d-tiles
+    DATA_TYPE* QK_chunk = shared_mem_data;                        // [BQ * D_TILE_QK + BK * D_TILE_QK]
+    // V chunk: space for V d-tile
+    DATA_TYPE* V_chunk = QK_chunk + (BQ + BK) * D_TILE_QK;       // [BK * D_TILE_V]
+    // S: attention scores
+    DATA_TYPE* S = V_chunk + BK * D_TILE_V;                      // [BQ * BK]
     
     float* float_buf = reinterpret_cast<float*>(S + BQ * BK);
     float* m = float_buf;                                         // [BQ]
     float* l = m + BQ;                                            // [BQ]
     float* alpha = l + BQ;                                        // [BQ]
     
-    // Load Q tile (all threads participate)
-    for (int idx = threadIdx.x; idx < q_len * D; idx += blockDim.x) {
-        int i = idx / D;
-        int j = idx % D;
-        Q_tile[idx2d(i, j, D)] = Q[base_offset + idx2d(q_start + i, j, D)];
-    }
+    // Register-based O_acc: each thread owns elems_per_thread output elements
+    constexpr int total_output = BQ * D;
+    constexpr int elems_per_thread = (total_output + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    float O_reg[elems_per_thread];
+    int thread_start_elem = threadIdx.x * elems_per_thread;
     
     // Initialize streaming state
     for (int i = threadIdx.x; i < BQ; i += blockDim.x) {
         m[i] = -INFINITY;
         l[i] = 0.0f;
     }
-    for (int i = threadIdx.x; i < BQ * D; i += blockDim.x) {
-        O_acc[i] = FLOAT_TO_DATA(0.0f);
+    
+    // Initialize register-based output
+    for (int t = 0; t < elems_per_thread; t++) {
+        O_reg[t] = 0.0f;
     }
     __syncthreads();
     
@@ -259,32 +289,22 @@ __global__ void flash_attention_kernel(
         int k_end = min(k_start + BK, L);
         int k_len = k_end - k_start;
         
-        // Load K tile
-        for (int idx = threadIdx.x; idx < k_len * D; idx += blockDim.x) {
-            int i = idx / D;
-            int j = idx % D;
-            K_tile[idx2d(i, j, D)] = K[base_offset + idx2d(k_start + i, j, D)];
-        }
-        
-        // Load V tile
-        for (int idx = threadIdx.x; idx < k_len * D; idx += blockDim.x) {
-            int i = idx / D;
-            int j = idx % D;
-            V_tile[idx2d(i, j, D)] = V[base_offset + idx2d(k_start + i, j, D)];
-        }
-        __syncthreads();
-        
-        // Process this KV tile
-        process_kv_tile(Q_tile, K_tile, V_tile, m, l, O_acc,
-                       q_len, k_len, d_runtime, d_tile_qk_runtime, d_tile_v_runtime, S, alpha);
+        // Process this KV tile with TRUE d-tiling
+        process_kv_tile(Q, K, V, q_start, k_start, q_len, k_len, d_runtime,
+                       m, l, O_reg, QK_chunk, V_chunk, S, alpha,
+                       d_tile_qk_runtime, d_tile_v_runtime, base_offset,
+                       elems_per_thread, thread_start_elem);
     }
     
-    // Finalize and store to output
-    for (int i = threadIdx.x; i < q_len * D; i += blockDim.x) {
-        int row = i / D;
-        int col = i % D;
-        O[base_offset + idx2d(q_start + row, col, D)] = 
-            FLOAT_TO_DATA(DATA_TO_FLOAT(O_acc[idx2d(row, col, D)]) / l[row]);
+    // Finalize and store to output from registers
+    for (int t = 0; t < elems_per_thread; t++) {
+        int linear_idx = thread_start_elem + t;
+        if (linear_idx < q_len * D) {
+            int row = linear_idx / D;
+            int col = linear_idx % D;
+            O[base_offset + idx2d(q_start + row, col, D)] = 
+                FLOAT_TO_DATA(O_reg[t] / l[row]);
+        }
     }
 }
 
@@ -306,13 +326,11 @@ void flash_attention_v1(
     assert(d_tile_qk_runtime > 0 && d_tile_qk_runtime <= d_runtime && "d_tile_qk must be valid");
     assert(d_tile_v_runtime > 0 && d_tile_v_runtime <= d_runtime && "d_tile_v must be valid");
     
-    // Calculate shared memory size
+    // Calculate shared memory size with TRUE d-tiling
     size_t shared_mem_size = (
-        BQ * D +      // Q_tile
-        BK * D +      // K_tile
-        BK * D +      // V_tile
-        BQ * D +      // O_acc
-        BQ * BK       // S
+        (BQ + BK) * D_TILE_QK +  // QK_chunk (Q and K d-tiles)
+        BK * D_TILE_V +          // V_chunk
+        BQ * BK                  // S
     ) * sizeof(DATA_TYPE) + (
         BQ +          // m
         BQ +          // l

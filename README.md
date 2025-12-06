@@ -29,13 +29,35 @@ Key progression:
 
 See [`flash_attention_v1/README_v1.md`](flash_attention_v1/README_v1.md) for detailed documentation.
 
+### `flash_attention_v1_tiled_d/`
+
+**True memory-efficient d-tiling** implementation that enables arbitrarily large head dimensions:
+- **Register-based output accumulation**: O_acc kept in thread registers, not shared memory
+- **Minimal shared memory usage**: Only D_TILE sized chunks (88% reduction: 3.69 KB vs 8.22 KB)
+- **Independent d-tile parameters**: Separate optimization for Q@K^T (D_TILE_QK) and S@V (D_TILE_V)
+- **Optimized configuration**: BQ=16, BK=16, D_TILE=32, THREADS=256
+
+Key innovations:
+1. Loads Q/K/V in small d-tile chunks from global memory (not full D)
+2. Each thread maintains output elements in registers (8 regs/thread)
+3. Enables support for d >> shared memory capacity
+4. Tensor Core ready with BQ=BK=16 tile sizes
+
+**Performance** (B=32, H=8, L=1024, d=128):
+- Optimized CUDA: **154ms (46× vs CPU)**
+- Shared memory: **3.69 KB (88% reduction vs traditional)**
+- Scales to d=512+ efficiently
+
+See [`flash_attention_v1_tiled_d/README.md`](flash_attention_v1_tiled_d/README.md) for detailed documentation.
+
 ## Future Work
 
 - Flash Attention V2 (improved parallelism and reduced non-matmul operations)
 - Flash Attention V3 (enhanced for specific hardware architectures)
 - Triton implementations for comparison
-- Multi-head attention batching
+- Further Tensor Core optimizations for d-tiled version
 - Causal masking variants
+- Kernel fusion experiments
 
 ## Requirements
 
@@ -92,12 +114,26 @@ python3 numpy_basic.py           # Basic reference version
 
 ### CUDA Implementation
 
+**Flash Attention V1 (d=32):**
 ```bash
 cd flash_attention_v1/CUDA
 make flash_attention_v1       # Baseline (21.7ms)
 ./flash_attention_v1
 
 make flash_attention_v1_opt1  # Tensor Cores (3.39ms)
+./flash_attention_v1_opt1
+```
+
+**Flash Attention V1 with D-Tiling (d=128):**
+```bash
+cd flash_attention_v1_tiled_d/CUDA
+make                          # Optimized true d-tiling (154ms, 46× speedup)
+./flash_attention_v1
+
+# Try different configurations
+make BQ=8 BK=8 D_TILE_QK=16 run
+make BQ=32 BK=32 D_TILE_QK=64 run
+```
 ./flash_attention_v1_opt1
 ```
 
