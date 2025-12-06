@@ -54,10 +54,6 @@ See [`flash_attention_v1_tiled_d/README.md`](flash_attention_v1_tiled_d/README.m
 
 - Flash Attention V2 (improved parallelism and reduced non-matmul operations)
 - Flash Attention V3 (enhanced for specific hardware architectures)
-- Triton implementations for comparison
-- Further Tensor Core optimizations for d-tiled version
-- Causal masking variants
-- Kernel fusion experiments
 
 ## Requirements
 
